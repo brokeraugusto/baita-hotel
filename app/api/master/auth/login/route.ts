@@ -11,6 +11,10 @@ function createSupabaseClient() {
       throw new Error("Missing Supabase credentials")
     }
 
+    console.log("Creating Supabase client with:")
+    console.log("- URL:", url.substring(0, 30) + "...")
+    console.log("- Key:", key.substring(0, 20) + "...")
+
     return createClient(url, key, {
       auth: {
         autoRefreshToken: false,
@@ -44,6 +48,7 @@ export async function GET() {
           details: {
             NEXT_PUBLIC_SUPABASE_URL: hasUrl ? "✓" : "✗",
             SUPABASE_SERVICE_ROLE_KEY: hasKey ? "✓" : "✗",
+            hint: "Configure Supabase environment variables",
           },
         },
         { status: 500 },
@@ -63,15 +68,49 @@ export async function GET() {
       .limit(5)
 
     if (error) {
-      console.error("Database error:", error)
+      console.error("Database error details:", {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+      })
+
+      let errorMessage = "Database error"
+      let hint = ""
+      let setupScript = ""
+
+      switch (error.code) {
+        case "42P01":
+          errorMessage = "Table 'master_admins' does not exist"
+          hint = "Database tables need to be created"
+          setupScript = "scripts/auth-separation/00-complete-system-setup.sql"
+          break
+        case "42501":
+          errorMessage = "Permission denied for table master_admins"
+          hint = "Database permissions need to be configured"
+          setupScript = "scripts/auth-separation/04-fix-permissions-and-rls.sql"
+          break
+        default:
+          errorMessage = `Database error: ${error.message}`
+          hint = error.hint || "Check database configuration"
+          setupScript = "scripts/auth-separation/00-complete-system-setup.sql"
+      }
+
       return NextResponse.json(
         {
           status: "error",
-          message: "Database error",
+          message: errorMessage,
           details: {
             code: error.code,
             message: error.message,
-            hint: error.code === "42P01" ? "Run setup scripts first" : error.hint,
+            hint: hint,
+            setupScript: setupScript,
+            instructions: [
+              "1. Go to your Supabase dashboard",
+              "2. Open the SQL Editor",
+              `3. Run the script: ${setupScript}`,
+              "4. Refresh this page to test again",
+            ],
           },
         },
         { status: 500 },
@@ -102,8 +141,12 @@ export async function GET() {
       {
         status: "error",
         message: "Internal server error",
-        details: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error && process.env.NODE_ENV === "development" ? error.stack : undefined,
+        details: {
+          error: error instanceof Error ? error.message : "Unknown error",
+          hint: "Run the complete system setup script",
+          setupScript: "scripts/auth-separation/00-complete-system-setup.sql",
+          stack: error instanceof Error && process.env.NODE_ENV === "development" ? error.stack : undefined,
+        },
       },
       { status: 500 },
     )
@@ -162,27 +205,62 @@ export async function POST(request: NextRequest) {
     const supabase = createSupabaseClient()
     console.log("✓ Supabase client created for login")
 
-    // Buscar usuário
-    console.log("Searching for user in database...")
+    // Primeiro, verificar se a tabela existe
+    console.log("Checking if master_admins table exists...")
+    const { data: tableCheck, error: tableError } = await supabase.from("master_admins").select("count").limit(1)
+
+    if (tableError && tableError.code === "42P01") {
+      console.log("❌ Table master_admins does not exist")
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Database not configured",
+          details: {
+            message: "Table 'master_admins' does not exist",
+            hint: "Run the complete system setup script",
+            setupScript: "scripts/auth-separation/00-complete-system-setup.sql",
+            instructions: [
+              "1. Go to your Supabase dashboard",
+              "2. Open the SQL Editor",
+              "3. Run the script: scripts/auth-separation/00-complete-system-setup.sql",
+              "4. Try logging in again",
+            ],
+          },
+        },
+        { status: 500 },
+      )
+    }
+
+    // Buscar usuário específico (ativo)
+    console.log("Searching for active user in database...")
     const { data: user, error } = await supabase
       .from("master_admins")
       .select("*")
       .eq("email", email.toLowerCase().trim())
       .eq("is_active", true)
-      .single()
+      .maybeSingle()
 
     if (error) {
-      console.error("Database query error:", error)
+      console.error("Database query error details:", {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+      })
 
-      if (error.code === "PGRST116") {
-        // No rows returned
-        console.log("❌ User not found in database")
+      if (error.code === "42501") {
+        console.log("❌ Permission denied - RLS issue")
         return NextResponse.json(
           {
             success: false,
-            error: "Invalid credentials",
+            error: "Database permission error",
+            details: {
+              message: "Permission denied for table master_admins",
+              hint: "Run permissions script",
+              setupScript: "scripts/auth-separation/04-fix-permissions-and-rls.sql",
+            },
           },
-          { status: 401 },
+          { status: 500 },
         )
       }
 
@@ -190,24 +268,35 @@ export async function POST(request: NextRequest) {
         {
           success: false,
           error: "Database error",
-          details: error.message,
+          details: {
+            message: error.message,
+            hint: "Check database configuration",
+            setupScript: "scripts/auth-separation/00-complete-system-setup.sql",
+          },
         },
         { status: 500 },
       )
     }
 
     if (!user) {
-      console.log("❌ User not found:", email)
+      console.log("❌ No active user found:", email)
       return NextResponse.json(
         {
           success: false,
           error: "Invalid credentials",
+          details: {
+            hint: "Check email and password, or create a master admin",
+            defaultCredentials: {
+              email: "admin@baitahotel.com",
+              password: "MasterAdmin2024!",
+            },
+          },
         },
         { status: 401 },
       )
     }
 
-    console.log("✓ User found:", user.email)
+    console.log("✓ User found:", user.email, "ID:", user.id)
 
     // Verificar senha (comparação simples)
     console.log("Verifying password...")
@@ -219,6 +308,13 @@ export async function POST(request: NextRequest) {
         {
           success: false,
           error: "Invalid credentials",
+          details: {
+            hint: "Check your password",
+            defaultCredentials: {
+              email: "admin@baitahotel.com",
+              password: "MasterAdmin2024!",
+            },
+          },
         },
         { status: 401 },
       )
@@ -229,8 +325,16 @@ export async function POST(request: NextRequest) {
     // Atualizar último login
     try {
       console.log("Updating last login...")
-      await supabase.from("master_admins").update({ last_login_at: new Date().toISOString() }).eq("id", user.id)
-      console.log("✓ Last login updated")
+      const { error: updateError } = await supabase
+        .from("master_admins")
+        .update({ last_login_at: new Date().toISOString() })
+        .eq("id", user.id)
+
+      if (updateError) {
+        console.warn("Failed to update last login:", updateError)
+      } else {
+        console.log("✓ Last login updated")
+      }
     } catch (updateError) {
       console.warn("Failed to update last login:", updateError)
       // Não falhar o login por causa disso
@@ -257,8 +361,12 @@ export async function POST(request: NextRequest) {
       {
         success: false,
         error: "Internal server error",
-        details: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error && process.env.NODE_ENV === "development" ? error.stack : undefined,
+        details: {
+          message: error instanceof Error ? error.message : "Unknown error",
+          hint: "Run the complete system setup script",
+          setupScript: "scripts/auth-separation/00-complete-system-setup.sql",
+          stack: error instanceof Error && process.env.NODE_ENV === "development" ? error.stack : undefined,
+        },
       },
       { status: 500 },
     )
